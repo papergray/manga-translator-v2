@@ -102,38 +102,47 @@ jobs:
         run: npm run dist
 
       - name: List release files
-        working-directory: windows/release
-        run: dir
+        shell: pwsh
+        run: |
+          Write-Host "=== Contents of windows/ ==="
+          Get-ChildItem windows/ | ForEach-Object { Write-Host "  $($_.Name)" }
+          Write-Host "=== Contents of windows/dist-electron/ ==="
+          if (Test-Path "windows/dist-electron") {
+            Get-ChildItem "windows/dist-electron" -Recurse | ForEach-Object { Write-Host "  $($_.FullName)" }
+          } else {
+            Write-Host "  (dist-electron not found)"
+          }
 
       - name: Rename EXE files
         shell: pwsh
         run: |
           $tag = "${{ needs.setup.outputs.tag }}"
-          $dir = Resolve-Path "windows/release"
-          Write-Host "Files in release dir:"
+          # electron-builder outputs to the "output" dir defined in package.json → dist-electron
+          $dir = "windows/dist-electron"
+          if (-not (Test-Path $dir)) {
+            Write-Error "Output dir not found: $dir"; exit 1
+          }
+          Write-Host "Files in $dir :"
           Get-ChildItem $dir | ForEach-Object { Write-Host "  $($_.Name)" }
 
-          # electron-builder actual output:
-          #   "Manga Translator Setup X.X.X.exe"  → NSIS installer (has "Setup")
-          #   "Manga Translator X.X.X.exe"        → portable (no "Setup")
-          # Rename-Item dst must be bare filename only, not a path
           $installer = Get-ChildItem "$dir/*.exe" | Where-Object { $_.Name -match "Setup" } | Select-Object -First 1
-          $portable  = Get-ChildItem "$dir/*.exe" | Where-Object { $_.Name -notmatch "Setup" } | Select-Object -First 1
+          $portable  = Get-ChildItem "$dir/*.exe" | Where-Object { $_.Name -notmatch "Setup" -and $_.Name -match "\.exe$" } | Select-Object -First 1
 
           if ($installer) {
             Rename-Item $installer.FullName "MangaTranslator-${tag}-Windows-Setup.exe"
-            Write-Host "Installer renamed OK"
-          }
+            Write-Host "Installer renamed: MangaTranslator-${tag}-Windows-Setup.exe"
+          } else { Write-Warning "No installer EXE found" }
+
           if ($portable) {
             Rename-Item $portable.FullName "MangaTranslator-${tag}-Windows-Portable.exe"
-            Write-Host "Portable renamed OK"
-          }
+            Write-Host "Portable renamed: MangaTranslator-${tag}-Windows-Portable.exe"
+          } else { Write-Warning "No portable EXE found" }
 
       - name: Upload EXE artifacts
         uses: actions/upload-artifact@v4
         with:
           name: windows-exe-${{ needs.setup.outputs.tag }}
-          path: windows/release/MangaTranslator-*.exe
+          path: windows/dist-electron/MangaTranslator-*.exe
           retention-days: 3
 
   # ─── Create GitHub Release ────────────────────────────────────────────────────

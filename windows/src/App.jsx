@@ -39,10 +39,8 @@ async function loadJSZip() {
 
 // ─── Capacitor Filesystem + Notifications (Android) ─────────────────────────
 async function getCapacitorFilesystem() {
-  // Capacitor only available on Android — gracefully return null on Windows/web
   if (typeof window === "undefined" || !window.Capacitor) return null;
   try {
-    // Use Function constructor so Rollup won't try to bundle this path
     const imp = new Function("m", "return import(m)");
     const mod = await imp("@capacitor/filesystem");
     return mod.Filesystem;
@@ -111,7 +109,7 @@ async function saveCBZ(pages, filename, folderPath) {
         const b64 = await new Promise(res => { reader.onload = () => res(reader.result.split(",")[1]); reader.readAsDataURL(blob); });
         // Ensure directory exists
         try { await FS.mkdir({ path: folderPath, directory: "EXTERNAL_STORAGE", recursive: true }); } catch {}
-        await FS.writeFile({ path: `${folderPath}/${filename}`, data: b64, directory: "EXTERNAL_STORAGE" });
+        await FS.writeFile({ path: `${folderPath}/${filename}`, data: b64, directory: "EXTERNAL_STORAGE", encoding: "base64" });
         return { savedTo: `${folderPath}/${filename}` };
       } catch (e) {
         console.warn("Capacitor write failed, falling back to browser download:", e);
@@ -136,16 +134,25 @@ async function saveJPGs(pages, folderPath) {
         try { await FS.mkdir({ path: folderPath, directory: "EXTERNAL_STORAGE", recursive: true }); } catch {}
         for (const { name, src } of pages) {
           const base64 = src.split(",")[1];
-          await FS.writeFile({ path: `${folderPath}/${name}`, data: base64, directory: "EXTERNAL_STORAGE" });
+          await FS.writeFile({ path: `${folderPath}/${name}`, data: base64, directory: "EXTERNAL_STORAGE", encoding: "base64" });
         }
         return { savedTo: folderPath };
       } catch (e) { console.warn("Capacitor write failed:", e); }
     }
   }
-  // Fallback: individual downloads
-  pages.forEach(({ name, src }) => {
-    const a = document.createElement("a"); a.href = src; a.download = name; a.click();
-  });
+  // Fallback: zip all into one download (browsers block multiple rapid clicks)
+  const JSZip = await loadJSZip();
+  const zip = new JSZip();
+  for (const { name, src } of pages) {
+    const base64 = src.split(",")[1];
+    zip.file(name, base64, { base64: true });
+  }
+  const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "translated-pages.zip";
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
   return { savedTo: null };
 }
 
@@ -362,8 +369,12 @@ async function callAPI(b64, apiId, apiKey, targetLang) {
 async function withRetry(fn, maxRetries = 4) {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try { return await fn(); } catch (e) {
-      if (e.message === "RATE_LIMIT" && attempt < maxRetries) {
-        await new Promise(r => setTimeout(r, [10000, 20000, 40000, 60000][attempt]));
+      // Never retry auth failures or daily quota exhaustion
+      if (e.message.startsWith("AUTH_FAILED") || e.message.includes("quota") || e.message.includes("DAILY")) throw e;
+      if ((e.message === "RATE_LIMIT" || e.message.includes("429")) && attempt < maxRetries) {
+        const wait = [15000, 30000, 60000, 90000][attempt];
+        console.warn(`Rate limited — waiting ${wait/1000}s (attempt ${attempt+1}/${maxRetries})`);
+        await new Promise(r => setTimeout(r, wait));
         continue;
       }
       throw e;
@@ -372,8 +383,15 @@ async function withRetry(fn, maxRetries = 4) {
 }
 
 // ─── Batch stitch ─────────────────────────────────────────────────────────────
-async function stitchImages(dataUrls, maxW = 768) {
-  const imgs = await Promise.all(dataUrls.map(loadImg));
+async function stitchImages(dataUrls, maxW = 1024) {
+  // Per-image loading with fallback — Promise.all would fail entire batch on one bad image
+  const imgs = await Promise.all(dataUrls.map(url =>
+    loadImg(url).catch(() => {
+      // Return a tiny 1x1 placeholder so the batch continues
+      const c = document.createElement("canvas"); c.width = 1; c.height = 1;
+      return c; // HTMLCanvasElement is a valid image source for drawImage
+    })
+  ));
   const scaled = imgs.map(img => {
     const s = Math.min(1, maxW / img.width);
     return { img, w: Math.round(img.width * s), h: Math.round(img.height * s) };
@@ -389,7 +407,7 @@ async function stitchImages(dataUrls, maxW = 768) {
     ctx.drawImage(img, 0, y, w, h);
     offsets.push({ y, h }); y += h;
   }
-  return { b64: canvas.toDataURL("image/jpeg", 0.60).split(",")[1], offsets, totalH };
+  return { b64: canvas.toDataURL("image/jpeg", 0.85).split(",")[1], offsets, totalH };
 }
 
 function remapBubbles(bubbles, offsets, totalH) {
@@ -411,10 +429,13 @@ function remapBubbles(bubbles, offsets, totalH) {
 }
 
 // ─── Canvas rendering ─────────────────────────────────────────────────────────
-function sampleBg(ctx, sx, sy, W, H) {
+function sampleBg(ctx, sx, sy, W, H, fallbackX, fallbackY) {
   try {
-    const px = Math.round(Math.max(0, Math.min(W - 1, (sx || 0) * W)));
-    const py = Math.round(Math.max(0, Math.min(H - 1, (sy || 0) * H)));
+    // If bg_sample coords not provided, sample from the center of the bubble area
+    const finalX = (sx != null && isFinite(sx)) ? sx : (fallbackX ?? 0.5);
+    const finalY = (sy != null && isFinite(sy)) ? sy : (fallbackY ?? 0.5);
+    const px = Math.round(Math.max(0, Math.min(W - 1, finalX * W)));
+    const py = Math.round(Math.max(0, Math.min(H - 1, finalY * H)));
     const d = ctx.getImageData(Math.max(0, px - 2), Math.max(0, py - 2), 5, 5).data;
     let r = 0, g = 0, b = 0, n = 0;
     for (let i = 0; i < d.length; i += 4) { r += d[i]; g += d[i+1]; b += d[i+2]; n++; }
@@ -465,7 +486,9 @@ function drawTranslations(canvas, img, bubbles, fontStyleId) {
     const bw = x2 - x1, bh = y2 - y1;
     if (bw < 8 || bh < 8) continue;
 
-    const { color: sampledBg, dark: sampledDark } = sampleBg(ctx, b.bg_sample_x, b.bg_sample_y, img.width, img.height);
+    const bubbleCenterX = (b.x1 + b.x2) / 2;
+    const bubbleCenterY = (b.y1 + b.y2) / 2;
+    const { color: sampledBg, dark: sampledDark } = sampleBg(ctx, b.bg_sample_x, b.bg_sample_y, img.width, img.height, bubbleCenterX, bubbleCenterY);
     const isDark = b.dark_bg ?? sampledDark;
     const style = b.style || "speech";
 
@@ -754,7 +777,7 @@ function DownloadAIModal({ onDone, onClose }) {
   );
 }
 
-function SettingsDrawer({ activeApi, setActiveApi, keys, setKeys, targetLang, setTargetLang, fontStyle, setFontStyle, memoryTier, setMemoryTierVal, downloadFolder, setDownloadFolder, modelsReady, onDownloadAI, onClose }) {
+function SettingsDrawer({ activeApi, setActiveApi, keys, setKeys, targetLang, setTargetLang, fontStyle, setFontStyle, memoryTier, setMemoryTierVal, downloadFolder, setDownloadFolder, srcLang, setSrcLang, modelsReady, onDownloadAI, onClose }) {
   const [editApi, setEditApi] = useState(activeApi);
   const [keyInput, setKeyInput] = useState(keys[activeApi] ? "••••" + keys[activeApi].slice(-4) : "");
   const [show, setShow] = useState(false);
@@ -809,13 +832,37 @@ function SettingsDrawer({ activeApi, setActiveApi, keys, setKeys, targetLang, se
           </div>
         </div>
 
+        {/* Source language (for on-device OCR) */}
+        {activeApi === "ondevice" && (
+          <div style={{ marginBottom: 18 }}>
+            <span style={S.label}>SOURCE LANGUAGE (ON-DEVICE OCR)</span>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {[
+                { code: "auto",    label: "🔍 Auto-detect" },
+                { code: "chi_sim", label: "🇨🇳 Chinese (Simplified)" },
+                { code: "chi_tra", label: "🇹🇼 Chinese (Traditional)" },
+                { code: "jpn",     label: "🇯🇵 Japanese" },
+                { code: "kor",     label: "🇰🇷 Korean" },
+              ].map(l => (
+                <button key={l.code} onClick={() => { setSrcLang(l.code); localStorage.setItem("mt_src_lang", l.code); }}
+                  style={{ ...S.btn(srcLang === l.code, "#4a90d9"), fontSize: 10, padding: "5px 9px" }}>
+                  {l.label}
+                </button>
+              ))}
+            </div>
+            <div style={{ fontSize: 9, color: C.muted, marginTop: 5 }}>
+              Used when translating with On-Device AI. Auto-detect reads the URL or filename.
+            </div>
+          </div>
+        )}
+
         {/* Font style */}
         <div style={{ marginBottom: 18 }}>
           <span style={S.label}>FONT STYLE</span>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
             {Object.entries(FONT_STYLES).map(([id, f]) => (
               <button key={id} onClick={() => { setFontStyle(id); localStorage.setItem("mt_font", id); }}
-                style={{ ...S.btn(fontStyle === id), fontFamily: f.css(14).split(" ").slice(1).join(" "), fontSize: 13, padding: "7px 14px" }}>
+                style={{ ...S.btn(fontStyle === id), fontFamily: f.css(14).replace(/^\d+px\s*/, ""), fontSize: 13, padding: "7px 14px" }}>
                 {f.label}
               </button>
             ))}
@@ -999,7 +1046,7 @@ function CFBypassModal({ url, onSuccess, onClose, addLog }) {
         src={url}
         style={{ flex: 1, border: "none", width: "100%" }}
         title="Cloudflare bypass"
-        sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+        sandbox="allow-scripts allow-forms allow-popups"
       />
 
       {/* Footer */}
@@ -1044,6 +1091,7 @@ function URLTab({ onImagesReady }) {
       const dataUrls = await scrapeURL(url.trim(), addLog);
       if (!dataUrls.length) throw new Error("No manga pages found on this URL.");
       addLog(`✅ Downloaded ${dataUrls.length} page${dataUrls.length > 1 ? "s" : ""} — starting translation…`);
+      setLoading(false);
       onImagesReady(dataUrls, url.trim());
     } catch (e) {
       if (e.message.startsWith("NEEDS_CF_BYPASS:")) {
@@ -1069,6 +1117,7 @@ function URLTab({ onImagesReady }) {
           addLog={addLog}
           onSuccess={dataUrls => {
             setCfBypassUrl(null);
+            setError("");
             onImagesReady(dataUrls, cfBypassUrl);
           }}
           onClose={errMsg => {
@@ -1142,19 +1191,23 @@ export default function App() {
   const [modelsReady, setModelsReady]       = useState(areModelsDownloaded());
   const [view, setView]       = useState("translate"); // "translate" | "reader"
   const [pages, setPages]         = useState([]);
-  const [originals, setOriginals]   = useState([]); // raw dataUrls before translation
+  const originalsRef = useRef([]); // raw dataUrls before translation (ref to avoid 10MB state re-renders)
   const [status, setStatus]   = useState("idle");
   const [progress, setProgress] = useState({ current: 0, total: 0 });
   const [log, setLog]         = useState([]);
   const [viewerWidth, setViewerWidth] = useState(100);
   const [showSettings, setShowSettings] = useState(false);
   const [fontReady, setFontReady] = useState(false);
+  const [srcLang, setSrcLang]     = useState(localStorage.getItem("mt_src_lang") || "auto");
 
   const outputsRef = useRef([]);
   const logEndRef  = useRef(null);
+  const notifTimerRef = useRef(null);
 
   useEffect(() => { loadFonts().then(() => setFontReady(true)); }, []);
   useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [log]);
+  // Request notification permission once on mount
+  useEffect(() => { requestNotificationPermission(); }, []);
 
   if (!setupDone) {
     return <SetupScreen onSave={(apiId, k) => {
@@ -1168,10 +1221,13 @@ export default function App() {
 
   // ── Core translate pipeline ──────────────────────────────────────────────────
   const translateDataUrls = async (dataUrls, sourceLabel) => {
+    // Guard against concurrent translations
+    if (status === "translating") {
+      addLog("⚠️  Already translating — please wait for current job to finish.");
+      return;
+    }
     if (!fontReady) await loadFonts();
-    setStatus("loading"); setLog([]); setPages([]); setOriginals(dataUrls); outputsRef.current = [];
-    // Request notification permission and show initial notification
-    await requestNotificationPermission();
+    setStatus("translating"); setLog([]); setPages([]); originalsRef.current = dataUrls; outputsRef.current = [];
     await showProgressNotification("Manga Translator", "Starting translation…", 0, dataUrls.length);
     const apiKey = keys[activeApi];
 
@@ -1188,13 +1244,29 @@ export default function App() {
     try {
       if (activeApi === "ondevice") {
         setMemoryTier(memoryTier);
+        // Auto-detect source language from label (URL host / filename)
+        // Determine source language: user override > URL domain hints > filename hints > default
+        let detectedLang = srcLang !== "auto" ? srcLang : (() => {
+          const lbl = sourceLabel.toLowerCase();
+          // URL domain patterns (covers scraped sources)
+          if (/senmanga|senmanga\.com|raw\.sen/.test(lbl)) return "jpn";
+          if (/comic\.naver|webtoon\.naver|kakao/.test(lbl)) return "kor";
+          if (/\.jp(\/|$)/.test(lbl) || /japan|jpn/.test(lbl)) return "jpn";
+          if (/\.kr(\/|$)/.test(lbl) || /korea|kor/.test(lbl)) return "kor";
+          if (/chi_tra|traditional|繁|hant/.test(lbl)) return "chi_tra";
+          // Filename hints for CBZ
+          if (/[぀-ゟ゠-ヿ]/.test(sourceLabel)) return "jpn"; // hiragana/katakana in filename
+          if (/[가-힯]/.test(sourceLabel)) return "kor"; // hangul in filename
+          return "chi_sim"; // default
+        })();
+        addLog(`🔍 Source language: ${detectedLang}`);
         for (let i = 0; i < totalPages; i++) {
           setProgress({ current: i + 1, total: totalPages });
           addLog(`🔄 [${i+1}/${totalPages}] Page ${i + 1}`);
           await showProgressNotification("Translating…", `Page ${i+1} of ${totalPages}`, i+1, totalPages);
           let bubbles = [];
           try {
-            const r = await translatePageOnDevice(dataUrls[i], "chi_sim", targetLang, addLog, addLog);
+            const r = await translatePageOnDevice(dataUrls[i], detectedLang, targetLang, addLog, addLog);
             bubbles = r.bubbles || [];
           } catch (e) { addLog(`   ⚠️  ${e.message}`); }
           const img = await loadImg(dataUrls[i]);
@@ -1219,14 +1291,16 @@ export default function App() {
           addLog(`   🖼  ${Math.round(b64.length * 0.75 / 1024)}KB stitched`);
 
           let perPage = batchUrls.map(() => []);
+          let batchError = false;
           try {
             const r = await withRetry(() => callAPI(b64, activeApi, apiKey, targetLang));
             const bubbles = r.bubbles || [];
             addLog(`   ✅ ${bubbles.length} bubbles across ${batchUrls.length} pages`);
             perPage = remapBubbles(bubbles, offsets, totalH);
           } catch (e) {
+            batchError = true;
             if (e.message === "RATE_LIMIT") addLog("   ⏳ Rate limit hit even after retries");
-            else if (e.message.startsWith("AUTH_FAILED")) addLog("   🔑 Key rejected — open Settings");
+            else if (e.message.startsWith("AUTH_FAILED")) { addLog("   🔑 Key rejected — open Settings"); throw e; }
             else addLog(`   ⚠️  ${e.message}`);
           }
 
@@ -1243,8 +1317,10 @@ export default function App() {
           }
 
           if (bi < numBatches - 1 && activeApi === "gemini") {
-            addLog("   ⏱  15s cool-down…");
-            await new Promise(r => setTimeout(r, 15000));
+            // Cool-down after every batch (including failed ones) to avoid hammering rate limits
+            const wait = batchError ? 30000 : 15000;
+            addLog(`   ⏱  ${wait/1000}s cool-down…`);
+            await new Promise(r => setTimeout(r, wait));
           }
         }
       }
@@ -1252,7 +1328,8 @@ export default function App() {
       setStatus("done");
       addLog(`✅ Done! ${totalPages} pages translated → ${targetLang}`);
       await showProgressNotification("Manga Translator ✅", `${totalPages} pages translated!`, totalPages, totalPages);
-      setTimeout(cancelProgressNotification, 4000);
+      if (notifTimerRef.current) clearTimeout(notifTimerRef.current);
+      notifTimerRef.current = setTimeout(cancelProgressNotification, 4000);
     } catch (e) {
       setStatus("error"); addLog(`❌ ${e.message}`);
       cancelProgressNotification();
@@ -1261,10 +1338,21 @@ export default function App() {
 
   // ── File tab handlers ────────────────────────────────────────────────────────
   const processCBZ = async file => {
-    const JSZip = await loadJSZip();
-    const zip = await JSZip.loadAsync(file);
+    let zip;
+    try {
+      const JSZip = await loadJSZip();
+      zip = await JSZip.loadAsync(file);
+    } catch (e) {
+      addLog("❌ Could not open file: " + e.message);
+      setStatus("error");
+      return;
+    }
     const imageFiles = Object.keys(zip.files)
-      .filter(n => /\.(jpg|jpeg|png)$/i.test(n) && !zip.files[n].dir).sort();
+      .filter(n => /\.(jpg|jpeg|png)$/i.test(n) && !zip.files[n].dir)
+      .sort((a, b) => {
+        // Natural sort: "page2" < "page10" < "page11"
+        return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
+      });
     if (!imageFiles.length) { addLog("❌ No images found in archive"); return; }
     addLog(`📦 Extracting ${imageFiles.length} pages…`);
     const dataUrls = [];
@@ -1305,20 +1393,27 @@ export default function App() {
       </div>
 
       {/* Progress */}
-      {status !== "idle" && (
+      {(status === "translating" || status === "done" || status === "error") && (
         <div style={{ marginBottom: 12 }}>
           <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: C.muted, marginBottom: 5, letterSpacing: 1 }}>
-            <span>{status === "done" ? "COMPLETE" : "TRANSLATING"}</span>
-            <span style={{ color: status === "done" ? C.green : C.gold }}>{progress.current}/{progress.total} — {pct}%</span>
+            <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              {status === "done" ? "✅ COMPLETE" : status === "error" ? "❌ FAILED" : status === "translating" ? "⏳ TRANSLATING" : "⏳ LOADING…"}
+              {/* Reset button — clears stuck state */}
+              <button onClick={() => { setStatus("idle"); setProgress({ current: 0, total: 0 }); setLog([]); setPages([]); originalsRef.current = []; cancelProgressNotification(); }}
+                style={{ background: "none", border: `1px solid ${C.faint}`, color: "#555", padding: "1px 6px", fontSize: 9, borderRadius: 4, cursor: "pointer", fontFamily: "monospace" }}>
+                ✕ reset
+              </button>
+            </span>
+            <span style={{ color: status === "done" ? C.green : status === "error" ? C.red : C.gold }}>{progress.current}/{progress.total} — {pct}%</span>
           </div>
           <div style={{ height: 4, background: "#1a1a1a", borderRadius: 2 }}>
-            <div style={{ height: "100%", width: `${pct}%`, background: status === "done" ? C.green : C.gold, borderRadius: 2, transition: "width 0.3s" }} />
+            <div style={{ height: "100%", width: `${pct}%`, background: status === "done" ? C.green : status === "error" ? C.red : C.gold, borderRadius: 2, transition: "width 0.3s" }} />
           </div>
         </div>
       )}
 
-      {/* Action buttons */}
-      {status === "done" && (
+      {/* Action buttons — show when any pages translated, even on error/partial */}
+      {pages.length > 0 && (
         <div style={{ marginBottom: 12 }}>
           {/* Primary: Read */}
           <button onClick={() => setView("reader")}
@@ -1342,7 +1437,7 @@ export default function App() {
             <button
               title="Save original untranslated pages as a CBZ archive"
               onClick={() => {
-                const origPages = originals.map((src, i) => ({ name: `page-${String(i+1).padStart(3,"0")}.jpg`, src }));
+                const origPages = originalsRef.current.map((src, i) => ({ name: `page-${String(i+1).padStart(3,"0")}.jpg`, src }));
                 saveCBZ(origPages, "chapter-original.cbz", downloadFolder);
               }}
               style={{ background: "#111", color: "#888", border: `1px solid ${C.faint}`, padding: "10px 4px", fontFamily: "Bangers, cursive", fontSize: 11, letterSpacing: 1, cursor: "pointer", borderRadius: 7, textAlign: "center", lineHeight: 1.4 }}>
@@ -1484,6 +1579,7 @@ export default function App() {
           fontStyle={fontStyle} setFontStyle={setFontStyle}
           memoryTier={memoryTier} setMemoryTierVal={setMemoryTierVal}
           downloadFolder={downloadFolder} setDownloadFolder={setDownloadFolder}
+          srcLang={srcLang} setSrcLang={setSrcLang}
           modelsReady={modelsReady}
           onDownloadAI={() => { setShowSettings(false); setShowDownloadAI(true); }}
           onClose={() => setShowSettings(false)}
