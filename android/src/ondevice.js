@@ -1,249 +1,253 @@
-// ─── On-Device Translation Engine ─────────────────────────────────────────────
-// Uses Tesseract.js for OCR (bounding boxes) + Transformers.js for translation
-// Everything runs on the phone — no internet needed after first model download
+// ─── On-Device Translation Engine ──────────────────────────────────────────
+// OCR:         Tesseract.js  (chi_sim / chi_tra / jpn / kor)
+// Translation: Transformers.js + NLLB-200-distilled-600M
+//              (Meta's multilingual model — 200 languages, much better than opus-mt)
+//
+// NLLB-200 source: https://huggingface.co/Xenova/nllb-200-distilled-600M
 
-// Language packs for Tesseract OCR
-// Maps detected script → tesseract lang code + opus-mt model
-const LANG_CONFIGS = {
-  chi_sim: { label: "Chinese (Simplified)", tesseract: "chi_sim", model: "Xenova/opus-mt-zh-en" },
-  chi_tra: { label: "Chinese (Traditional)", tesseract: "chi_tra", model: "Xenova/opus-mt-zh-en" },
-  jpn:     { label: "Japanese",              tesseract: "jpn",     model: "Xenova/opus-mt-ja-en" },
-  kor:     { label: "Korean",                tesseract: "kor",     model: "Xenova/opus-mt-ko-en" },
+export const NLLB_MODEL = "Xenova/nllb-200-distilled-600M";
+
+// NLLB language codes for source scripts
+const NLLB_SRC = {
+  chi_sim: "zho_Hans",
+  chi_tra: "zho_Hant",
+  jpn:     "jpn_Jpan",
+  kor:     "kor_Hang",
 };
 
-// Memory tier → controls resolution + whether to keep model cached
+// NLLB target languages (covers all 15 UI options)
+export const NLLB_TARGETS = {
+  "English":    "eng_Latn",
+  "Spanish":    "spa_Latn",
+  "French":     "fra_Latn",
+  "German":     "deu_Latn",
+  "Portuguese": "por_Latn",
+  "Italian":    "ita_Latn",
+  "Russian":    "rus_Cyrl",
+  "Arabic":     "arb_Arab",
+  "Hindi":      "hin_Deva",
+  "Indonesian": "ind_Latn",
+  "Thai":       "tha_Thai",
+  "Vietnamese": "vie_Latn",
+  "Turkish":    "tur_Latn",
+  "Polish":     "pol_Latn",
+  "Dutch":      "nld_Latn",
+};
+
 export const MEMORY_TIERS = {
-  low:    { label: "Low (150MB)",    maxRes: 512,  keepCached: false, description: "Slower, less RAM" },
-  medium: { label: "Medium (300MB)", maxRes: 768,  keepCached: true,  description: "Recommended" },
-  high:   { label: "High (500MB)",   maxRes: 1024, keepCached: true,  description: "Faster, more RAM" },
+  low:    { label: "Low (~400MB)",    maxRes: 512,  keepCached: false, description: "Slower, uses less RAM" },
+  medium: { label: "Medium (~700MB)", maxRes: 768,  keepCached: true,  description: "Recommended" },
+  high:   { label: "High (~1.2GB)",   maxRes: 1024, keepCached: true,  description: "Fastest, more RAM needed" },
 };
+
+// Approximate size of all model files
+export const MODEL_SIZE_MB = 650;
 
 let _tesseractWorker = null;
 let _translationPipeline = null;
-let _loadedModel = null;
 let _memoryTier = "medium";
 
-export function setMemoryTier(tier) {
-  _memoryTier = tier;
-}
+export function setMemoryTier(tier) { _memoryTier = tier; }
 
-// Dynamically import to avoid loading on startup
 async function getTesseract() {
-  if (!window._Tesseract) {
-    const mod = await import("tesseract.js");
-    window._Tesseract = mod;
-  }
+  if (!window._Tesseract) window._Tesseract = await import("tesseract.js");
   return window._Tesseract;
 }
-
 async function getTransformers() {
-  if (!window._Transformers) {
-    const mod = await import("@xenova/transformers");
-    window._Transformers = mod;
-  }
+  if (!window._Transformers) window._Transformers = await import("@xenova/transformers");
   return window._Transformers;
 }
 
-// Resize image data URL to max dimension
+// ─── Pre-download: cache all model files before first use ─────────────────────
+// onProgress(pct: 0-100, message: string)
+export async function preDownloadModels(langs, onProgress) {
+  langs = langs || ["chi_sim"];
+  const Transformers = await getTransformers();
+  const { pipeline, env } = Transformers;
+  env.allowLocalModels = false;
+  env.useBrowserCache = true;
+
+  onProgress(1, "Connecting to HuggingFace Hub…");
+
+  const fileProgress = {};
+  const trackProgress = info => {
+    if (info.status === "downloading" && info.total > 0) {
+      fileProgress[info.file] = { loaded: info.loaded, total: info.total };
+      const loaded = Object.values(fileProgress).reduce((s, f) => s + f.loaded, 0);
+      const total  = Object.values(fileProgress).reduce((s, f) => s + f.total, 0);
+      const pct    = total > 0 ? Math.min(94, Math.round((loaded / total) * 94)) : 1;
+      onProgress(pct, `Downloading NLLB-200 model… ${Math.round(loaded/1e6)}MB / ${Math.round(total/1e6)}MB`);
+    }
+    if (info.status === "loading") onProgress(95, "Loading model into memory…");
+    if (info.status === "ready")   onProgress(97, "Model loaded!");
+  };
+
+  try {
+    _translationPipeline = await pipeline("translation", NLLB_MODEL, {
+      quantized: true,
+      progress_callback: trackProgress,
+    });
+  } catch (e) {
+    throw new Error("Model download failed: " + e.message);
+  }
+
+  // Pre-warm Tesseract language packs
+  const Tesseract = await getTesseract();
+  const tesseractLangs = { chi_sim: "chi_sim", chi_tra: "chi_tra", jpn: "jpn", kor: "kor" };
+  for (const langKey of langs) {
+    const tl = tesseractLangs[langKey] || "chi_sim";
+    onProgress(97, `Downloading OCR data (${tl})…`);
+    try {
+      const w = await Tesseract.createWorker(tl);
+      await w.terminate();
+    } catch {}
+  }
+
+  onProgress(100, "All models ready — you can now translate offline!");
+  localStorage.setItem("mt_models_downloaded", "true");
+  localStorage.setItem("mt_models_ts", Date.now().toString());
+}
+
+export function areModelsDownloaded() {
+  return localStorage.getItem("mt_models_downloaded") === "true";
+}
+
+// ─── Resize ───────────────────────────────────────────────────────────────────
 function resizeDataUrl(dataUrl, maxDim) {
   return new Promise(res => {
     const img = new Image();
     img.onload = () => {
       const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
-      const w = Math.round(img.width * scale);
-      const h = Math.round(img.height * scale);
-      const canvas = document.createElement("canvas");
-      canvas.width = w; canvas.height = h;
-      canvas.getContext("2d").drawImage(img, 0, 0, w, h);
-      res({ dataUrl: canvas.toDataURL("image/jpeg", 0.85), w, h, origW: img.width, origH: img.height });
+      const w = Math.round(img.width * scale), h = Math.round(img.height * scale);
+      const c = document.createElement("canvas");
+      c.width = w; c.height = h;
+      c.getContext("2d").drawImage(img, 0, 0, w, h);
+      res({ dataUrl: c.toDataURL("image/jpeg", 0.85), w, h });
     };
     img.src = dataUrl;
   });
 }
 
-// Group Tesseract word boxes into bubble regions using proximity clustering
+// ─── Cluster word boxes into speech-bubble regions ────────────────────────────
 function clusterBoxes(words, imgW, imgH) {
-  if (!words.length) return [];
-
-  // Filter low-confidence and very small results
   const valid = words.filter(w =>
-    w.confidence > 40 &&
-    w.bbox.x1 >= 0 && w.bbox.y1 >= 0 &&
-    w.text.trim().length > 0
+    w.confidence > 40 && w.bbox.x1 >= 0 && w.bbox.y1 >= 0 && w.text.trim().length > 0
   );
   if (!valid.length) return [];
-
-  // Merge words that are on the same line and close together
-  const GAP = Math.max(imgW, imgH) * 0.04; // 4% of larger dimension
+  const GAP = Math.max(imgW, imgH) * 0.04;
   const clusters = [];
-
   for (const word of valid) {
-    const box = word.bbox; // {x0, y0, x1, y1}
+    const box = word.bbox;
     let merged = false;
-    for (const cluster of clusters) {
-      const cx = cluster.bbox;
-      // Check vertical overlap and horizontal proximity
-      const vertOverlap = box.y0 < cx.y1 + GAP && box.y1 > cx.y0 - GAP;
-      const horizClose  = box.x0 < cx.x1 + GAP && box.x1 > cx.x0 - GAP;
-      if (vertOverlap && horizClose) {
-        cluster.bbox.x0 = Math.min(cx.x0, box.x0);
-        cluster.bbox.y0 = Math.min(cx.y0, box.y0);
-        cluster.bbox.x1 = Math.max(cx.x1, box.x1);
-        cluster.bbox.y1 = Math.max(cx.y1, box.y1);
-        cluster.text += " " + word.text;
-        cluster.conf = Math.min(cluster.conf, word.confidence);
-        merged = true;
-        break;
+    for (const cl of clusters) {
+      const cx = cl.bbox;
+      if (box.y0 < cx.y1 + GAP && box.y1 > cx.y0 - GAP &&
+          box.x0 < cx.x1 + GAP && box.x1 > cx.x0 - GAP) {
+        cx.x0 = Math.min(cx.x0, box.x0); cx.y0 = Math.min(cx.y0, box.y0);
+        cx.x1 = Math.max(cx.x1, box.x1); cx.y1 = Math.max(cx.y1, box.y1);
+        cl.text += " " + word.text;
+        cl.conf = Math.min(cl.conf, word.confidence);
+        merged = true; break;
       }
     }
-    if (!merged) {
-      clusters.push({
-        bbox: { x0: box.x0, y0: box.y0, x1: box.x1, y1: box.y1 },
-        text: word.text,
-        conf: word.confidence,
-      });
-    }
+    if (!merged) clusters.push({
+      bbox: { x0: box.x0, y0: box.y0, x1: box.x1, y1: box.y1 },
+      text: word.text, conf: word.confidence,
+    });
   }
-
-  // Convert to fractional coordinates
+  const PAD = 0.008;
   return clusters
     .filter(c => c.conf > 35 && c.text.trim().length > 1)
-    .map(c => {
-      const PAD = 0.008;
-      return {
-        x1: Math.max(0, c.bbox.x0 / imgW - PAD),
-        y1: Math.max(0, c.bbox.y0 / imgH - PAD),
-        x2: Math.min(1, c.bbox.x1 / imgW + PAD),
-        y2: Math.min(1, c.bbox.y1 / imgH + PAD),
-        sourceText: c.text.trim(),
-      };
-    });
+    .map(c => ({
+      x1: Math.max(0, c.bbox.x0/imgW - PAD), y1: Math.max(0, c.bbox.y0/imgH - PAD),
+      x2: Math.min(1, c.bbox.x1/imgW + PAD), y2: Math.min(1, c.bbox.y1/imgH + PAD),
+      sourceText: c.text.trim(),
+    }));
 }
 
-// Detect which language is most likely on the page
-async function detectLanguage(dataUrl, onLog) {
-  const Tesseract = await getTesseract();
-  const tier = MEMORY_TIERS[_memoryTier];
-  const { dataUrl: resized, w, h } = await resizeDataUrl(dataUrl, tier.maxRes);
-
-  // Quick pass with each CJK lang, pick highest average confidence
-  const scores = {};
-  for (const [key, cfg] of Object.entries(LANG_CONFIGS)) {
-    try {
-      const result = await Tesseract.recognize(resized, cfg.tesseract, { errorHandler: () => {} });
-      const words = result.data.words || [];
-      const goodWords = words.filter(w => w.confidence > 50);
-      scores[key] = goodWords.length > 0
-        ? goodWords.reduce((s, w) => s + w.confidence, 0) / goodWords.length
-        : 0;
-    } catch { scores[key] = 0; }
-  }
-
-  const best = Object.entries(scores).sort((a, b) => b[1] - a[1])[0];
-  onLog && onLog(`   🔍 Detected language: ${LANG_CONFIGS[best[0]]?.label} (${Math.round(best[1])}% confidence)`);
-  return best[0]; // returns key like "chi_sim"
-}
-
-// Full OCR pass — returns word boxes
+// ─── OCR ─────────────────────────────────────────────────────────────────────
 async function ocrPage(dataUrl, langKey) {
   const Tesseract = await getTesseract();
   const tier = MEMORY_TIERS[_memoryTier];
   const { dataUrl: resized, w, h } = await resizeDataUrl(dataUrl, tier.maxRes);
-
   if (_tesseractWorker && _tesseractWorker._lang !== langKey) {
     await _tesseractWorker.terminate();
     _tesseractWorker = null;
   }
-
   if (!_tesseractWorker) {
-    _tesseractWorker = await Tesseract.createWorker(LANG_CONFIGS[langKey].tesseract);
+    _tesseractWorker = await Tesseract.createWorker(langKey);
     _tesseractWorker._lang = langKey;
   }
-
   const result = await _tesseractWorker.recognize(resized);
-  const words = result.data.words || [];
-  return { words, imgW: w, imgH: h };
+  return { words: result.data.words || [], imgW: w, imgH: h };
 }
 
-// Load or reuse translation pipeline
-async function getTranslator(modelName, onProgress) {
+// ─── Load NLLB-200 pipeline ───────────────────────────────────────────────────
+async function getTranslator(onLog) {
+  if (_translationPipeline) return _translationPipeline;
   const Transformers = await getTransformers();
   const { pipeline, env } = Transformers;
-
-  // Allow loading from HuggingFace Hub (cached in IndexedDB)
   env.allowLocalModels = false;
   env.useBrowserCache = true;
-
-  if (_translationPipeline && _loadedModel === modelName) {
-    return _translationPipeline;
-  }
-
-  // Unload previous model if memory is tight
-  if (_translationPipeline && _loadedModel !== modelName) {
-    _translationPipeline = null;
-    _loadedModel = null;
-  }
-
-  _translationPipeline = await pipeline("translation", modelName, {
-    quantized: true, // Use INT8 quantized model — ~4x smaller
+  const fileProgress = {};
+  _translationPipeline = await pipeline("translation", NLLB_MODEL, {
+    quantized: true,
     progress_callback: info => {
       if (info.status === "downloading" && info.total > 0) {
-        const pct = Math.round((info.loaded / info.total) * 100);
-        onProgress && onProgress(`   📥 Downloading model: ${pct}% (${Math.round(info.loaded / 1e6)}MB / ${Math.round(info.total / 1e6)}MB)`);
+        fileProgress[info.file] = { loaded: info.loaded, total: info.total };
+        const loaded = Object.values(fileProgress).reduce((s, f) => s + f.loaded, 0);
+        const total  = Object.values(fileProgress).reduce((s, f) => s + f.total, 0);
+        const pct = total > 0 ? Math.round((loaded/total)*100) : 0;
+        onLog && onLog(`   📥 Downloading NLLB-200: ${pct}% (${Math.round(loaded/1e6)}MB / ${Math.round(total/1e6)}MB)`);
       }
-      if (info.status === "loading") onProgress && onProgress("   ⚙️ Loading model into memory…");
+      if (info.status === "loading") onLog && onLog("   ⚙️  Loading NLLB-200 into memory…");
     },
   });
-  _loadedModel = modelName;
   return _translationPipeline;
 }
 
-// Main on-device translate function
-// Returns { bubbles } same format as API calls
-export async function translatePageOnDevice(dataUrl, detectedLangKey, targetLang, onLog, onProgress) {
-  const tier = MEMORY_TIERS[_memoryTier];
-
-  // Step 1: OCR
+// ─── Main translate function ──────────────────────────────────────────────────
+export async function translatePageOnDevice(dataUrl, langKey, targetLang, onLog, onProgress) {
   onLog("   🔬 Running OCR…");
-  const { words, imgW, imgH } = await ocrPage(dataUrl, detectedLangKey);
+  const { words, imgW, imgH } = await ocrPage(dataUrl, langKey);
   const clusters = clusterBoxes(words, imgW, imgH);
-  onLog(`   📝 Found ${clusters.length} text region${clusters.length !== 1 ? "s" : ""}`);
-
+  onLog(`   📝 ${clusters.length} text region${clusters.length !== 1 ? "s" : ""}`);
   if (!clusters.length) return { bubbles: [] };
 
-  // Step 2: Load translation model
-  const modelName = LANG_CONFIGS[detectedLangKey].model;
-  onLog(`   🤖 Loading translator (${modelName})…`);
-  const translator = await getTranslator(modelName, msg => onLog(msg));
+  onLog("   🤖 Loading NLLB-200…");
+  const translator = await getTranslator(onLog);
 
-  // Step 3: Translate each cluster
-  const bubbles = [];
-  for (const cluster of clusters) {
-    try {
-      // Transformers.js translation
-      const result = await translator(cluster.sourceText, {
-        src_lang: detectedLangKey === "jpn" ? "ja" : detectedLangKey === "kor" ? "ko" : "zh",
-        tgt_lang: targetLang === "English" ? "en" : targetLang.slice(0, 2).toLowerCase(),
-      });
-      const translated = result[0]?.translation_text || cluster.sourceText;
-      bubbles.push({
-        x1: cluster.x1, y1: cluster.y1,
-        x2: cluster.x2, y2: cluster.y2,
-        translated,
-        font_size_frac: Math.min(0.06, (cluster.y2 - cluster.y1) * 0.5),
-        bg: "white", align: "center", style: "speech", dark_bg: false,
-      });
-    } catch (e) {
-      // Skip failed translations
+  const srcLang = NLLB_SRC[langKey] || "zho_Hans";
+  const tgtLang = NLLB_TARGETS[targetLang] || "eng_Latn";
+  const texts = clusters.map(c => c.sourceText);
+
+  let translations = [];
+  try {
+    // Batch translate — more efficient than one at a time
+    const results = await translator(texts, {
+      src_lang: srcLang, tgt_lang: tgtLang, max_new_tokens: 256,
+    });
+    translations = results.map(r => r.translation_text || "");
+  } catch {
+    // Individual fallback
+    for (const cluster of clusters) {
+      try {
+        const r = await translator(cluster.sourceText, {
+          src_lang: srcLang, tgt_lang: tgtLang, max_new_tokens: 128,
+        });
+        translations.push(r[0]?.translation_text || cluster.sourceText);
+      } catch { translations.push(cluster.sourceText); }
     }
   }
 
-  // Free memory if low tier
-  if (!tier.keepCached) {
-    _translationPipeline = null;
-    _loadedModel = null;
-  }
+  const bubbles = clusters.map((c, i) => ({
+    x1: c.x1, y1: c.y1, x2: c.x2, y2: c.y2,
+    translated: translations[i] || c.sourceText,
+    font_size_frac: Math.min(0.06, (c.y2 - c.y1) * 0.5),
+    bg: "white", align: "center", style: "speech", dark_bg: false,
+  }));
 
+  if (!MEMORY_TIERS[_memoryTier].keepCached) _translationPipeline = null;
   return { bubbles };
 }
 
@@ -252,6 +256,5 @@ export async function cleanupOnDevice() {
     await _tesseractWorker.terminate().catch(() => {});
     _tesseractWorker = null;
   }
-  _translationPipeline = null;
-  _loadedModel = null;
+  if (!MEMORY_TIERS[_memoryTier].keepCached) _translationPipeline = null;
 }

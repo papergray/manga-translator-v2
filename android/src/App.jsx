@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { scrapeURL, SUPPORTED_SITES } from "./scraper.js";
-import { translatePageOnDevice, cleanupOnDevice, setMemoryTier, MEMORY_TIERS } from "./ondevice.js";
+import { scrapeURL, retryHappyMHAfterCF, SUPPORTED_SITES } from "./scraper.js";
+import { translatePageOnDevice, cleanupOnDevice, setMemoryTier, MEMORY_TIERS, preDownloadModels, areModelsDownloaded, MODEL_SIZE_MB, NLLB_TARGETS } from "./ondevice.js";
 
 // ─── Fonts ────────────────────────────────────────────────────────────────────
 async function loadFonts() {
@@ -35,6 +35,112 @@ async function loadJSZip() {
     s.onerror = rej;
     document.head.appendChild(s);
   });
+}
+
+// ─── Capacitor Filesystem + Notifications (Android) ─────────────────────────
+async function getCapacitorFilesystem() {
+  try {
+    const mod = await import("@capacitor/filesystem");
+    return mod.Filesystem;
+  } catch { return null; }
+}
+async function getCapacitorNotifications() {
+  try {
+    const mod = await import("@capacitor/local-notifications");
+    return mod.LocalNotifications;
+  } catch { return null; }
+}
+
+// Request notification permission
+async function requestNotificationPermission() {
+  const LN = await getCapacitorNotifications();
+  if (!LN) return false;
+  try {
+    const perm = await LN.requestPermissions();
+    return perm.display === "granted";
+  } catch { return false; }
+}
+
+// Show/update a progress notification (Android only)
+let _notifId = 1;
+async function showProgressNotification(title, body, progress, total) {
+  const LN = await getCapacitorNotifications();
+  if (!LN) return;
+  try {
+    await LN.schedule({ notifications: [{
+      id:       _notifId,
+      title,
+      body,
+      ongoing:  progress < total,
+      autoCancel: progress >= total,
+      // Android progress bar
+      extra: { progress, total },
+    }]});
+  } catch {}
+}
+async function cancelProgressNotification() {
+  const LN = await getCapacitorNotifications();
+  if (!LN) return;
+  try { await LN.cancel({ notifications: [{ id: _notifId }] }); } catch {}
+}
+
+// ─── Save with folder support ─────────────────────────────────────────────────
+// folderPath: null = browser download, "Downloads/MangaTranslator" = Capacitor path
+async function saveCBZ(pages, filename, folderPath) {
+  const JSZip = await loadJSZip();
+  const zip = new JSZip();
+  for (const { name, src } of pages) {
+    const base64 = src.split(",")[1];
+    const ext = src.includes("image/png") ? "png" : "jpg";
+    zip.file(name.replace(/\.[^.]+$/, "") + "." + ext, base64, { base64: true });
+  }
+  const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } });
+
+  if (folderPath) {
+    // Android: write via Capacitor Filesystem API
+    const FS = await getCapacitorFilesystem();
+    if (FS) {
+      try {
+        const reader = new FileReader();
+        const b64 = await new Promise(res => { reader.onload = () => res(reader.result.split(",")[1]); reader.readAsDataURL(blob); });
+        // Ensure directory exists
+        try { await FS.mkdir({ path: folderPath, directory: "EXTERNAL_STORAGE", recursive: true }); } catch {}
+        await FS.writeFile({ path: `${folderPath}/${filename}`, data: b64, directory: "EXTERNAL_STORAGE" });
+        return { savedTo: `${folderPath}/${filename}` };
+      } catch (e) {
+        console.warn("Capacitor write failed, falling back to browser download:", e);
+      }
+    }
+  }
+
+  // Browser/fallback download
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  return { savedTo: null };
+}
+
+async function saveJPGs(pages, folderPath) {
+  if (folderPath) {
+    const FS = await getCapacitorFilesystem();
+    if (FS) {
+      try {
+        try { await FS.mkdir({ path: folderPath, directory: "EXTERNAL_STORAGE", recursive: true }); } catch {}
+        for (const { name, src } of pages) {
+          const base64 = src.split(",")[1];
+          await FS.writeFile({ path: `${folderPath}/${name}`, data: base64, directory: "EXTERNAL_STORAGE" });
+        }
+        return { savedTo: folderPath };
+      } catch (e) { console.warn("Capacitor write failed:", e); }
+    }
+  }
+  // Fallback: individual downloads
+  pages.forEach(({ name, src }) => {
+    const a = document.createElement("a"); a.href = src; a.download = name; a.click();
+  });
+  return { savedTo: null };
 }
 
 const blobToDataUrl = blob => new Promise(res => {
@@ -512,7 +618,137 @@ function SetupScreen({ onSave }) {
 }
 
 // ─── Settings Drawer ──────────────────────────────────────────────────────────
-function SettingsDrawer({ activeApi, setActiveApi, keys, setKeys, targetLang, setTargetLang, fontStyle, setFontStyle, memoryTier, setMemoryTierVal, onClose }) {
+// ─── Download AI Model Modal ──────────────────────────────────────────────────
+function DownloadAIModal({ onDone, onClose }) {
+  const [phase, setPhase]     = useState("confirm"); // confirm | downloading | done | error
+  const [pct, setPct]         = useState(0);
+  const [msg, setMsg]         = useState("");
+  const [errMsg, setErrMsg]   = useState("");
+  const [langKeys, setLangKeys] = useState(["chi_sim"]);
+
+  const LANG_OPTIONS = [
+    { key: "chi_sim", label: "Chinese (Simplified)" },
+    { key: "chi_tra", label: "Chinese (Traditional)" },
+    { key: "jpn",     label: "Japanese" },
+    { key: "kor",     label: "Korean" },
+  ];
+
+  const toggleLang = k => setLangKeys(prev =>
+    prev.includes(k) ? (prev.length > 1 ? prev.filter(x => x !== k) : prev) : [...prev, k]
+  );
+
+  const startDownload = async () => {
+    setPhase("downloading"); setPct(0); setMsg("Connecting…");
+    try {
+      await preDownloadModels(langKeys, (p, m) => { setPct(p); setMsg(m); });
+      setPhase("done");
+    } catch (e) {
+      setErrMsg(e.message); setPhase("error");
+    }
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.88)", zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div style={{ background: C.surface, border: `1px solid ${C.gold}44`, borderRadius: 16, padding: 24, width: "100%", maxWidth: 420 }}>
+
+        {/* Header */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18 }}>
+          <span style={{ fontFamily: "Bangers, cursive", fontSize: 22, letterSpacing: 3, color: C.gold }}>DOWNLOAD AI</span>
+          {phase !== "downloading" && (
+            <button onClick={onClose} style={{ background: "none", border: "none", color: C.muted, fontSize: 22, cursor: "pointer" }}>✕</button>
+          )}
+        </div>
+
+        {/* Model info */}
+        <div style={{ background: C.bg, border: `1px solid ${C.faint}`, borderRadius: 10, padding: "12px 14px", marginBottom: 18 }}>
+          <div style={{ fontSize: 13, color: C.gold, fontFamily: "Bangers, cursive", letterSpacing: 1, marginBottom: 4 }}>NLLB-200-distilled-600M</div>
+          <div style={{ fontSize: 10, color: C.muted, lineHeight: 1.7 }}>
+            Meta AI's multilingual translation model · ~650MB<br/>
+            Translates between 200 languages entirely on your device.<br/>
+            No internet needed after download · No API keys · No cost.
+          </div>
+        </div>
+
+        {phase === "confirm" && (
+          <>
+            <div style={{ marginBottom: 16 }}>
+              <div style={{ fontSize: 10, color: C.muted, letterSpacing: 2, marginBottom: 8 }}>ALSO DOWNLOAD OCR DATA FOR:</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 7 }}>
+                {LANG_OPTIONS.map(l => (
+                  <button key={l.key} onClick={() => toggleLang(l.key)}
+                    style={{ ...S.btn(langKeys.includes(l.key), C.green), fontSize: 11, padding: "6px 12px" }}>
+                    {langKeys.includes(l.key) ? "✓ " : ""}{l.label}
+                  </button>
+                ))}
+              </div>
+              <div style={{ fontSize: 9, color: "#444", marginTop: 6 }}>
+                OCR data adds ~30MB per language. Select the scripts you read.
+              </div>
+            </div>
+            <div style={{ fontSize: 10, color: "#555", marginBottom: 16, lineHeight: 1.6, background: "#0a0a0a", borderRadius: 8, padding: "10px 12px" }}>
+              ⚠️ Download requires ~650MB of data. Connect to Wi-Fi before starting.
+              Files are cached in your browser and survive app restarts.
+            </div>
+            <button onClick={startDownload}
+              style={{ width: "100%", background: C.gold, color: "#000", border: "none", padding: "14px 0", fontFamily: "Bangers, cursive", fontSize: 16, letterSpacing: 3, cursor: "pointer", borderRadius: 10 }}>
+              START DOWNLOAD →
+            </button>
+          </>
+        )}
+
+        {phase === "downloading" && (
+          <>
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+                <span style={{ fontSize: 11, color: C.text }}>Downloading…</span>
+                <span style={{ fontSize: 12, color: C.gold, fontFamily: "Bangers, cursive" }}>{pct}%</span>
+              </div>
+              <div style={{ background: "#111", borderRadius: 4, height: 8, overflow: "hidden" }}>
+                <div style={{ width: `${pct}%`, height: "100%", background: `linear-gradient(90deg, ${C.gold}, #ff9900)`, borderRadius: 4, transition: "width 0.5s" }} />
+              </div>
+            </div>
+            <div style={{ fontSize: 10, color: C.muted, lineHeight: 1.8, minHeight: 40 }}>{msg}</div>
+            <div style={{ fontSize: 9, color: "#333", marginTop: 10, textAlign: "center" }}>
+              Keep the app open · You can still read manga in the reader while downloading
+            </div>
+          </>
+        )}
+
+        {phase === "done" && (
+          <>
+            <div style={{ textAlign: "center", padding: "16px 0" }}>
+              <div style={{ fontSize: 40, marginBottom: 10 }}>✅</div>
+              <div style={{ fontFamily: "Bangers, cursive", fontSize: 20, letterSpacing: 3, color: C.green, marginBottom: 6 }}>MODELS READY!</div>
+              <div style={{ fontSize: 10, color: C.muted, lineHeight: 1.8 }}>
+                NLLB-200 is cached on your device.<br/>
+                On-Device translation now works fully offline.
+              </div>
+            </div>
+            <button onClick={onDone}
+              style={{ width: "100%", background: C.green, color: "#000", border: "none", padding: "14px 0", fontFamily: "Bangers, cursive", fontSize: 16, letterSpacing: 3, cursor: "pointer", borderRadius: 10 }}>
+              START TRANSLATING →
+            </button>
+          </>
+        )}
+
+        {phase === "error" && (
+          <>
+            <div style={{ background: "#1a0000", border: `1px solid ${C.red}44`, borderRadius: 10, padding: "12px 14px", marginBottom: 16 }}>
+              <div style={{ fontSize: 11, color: C.red, marginBottom: 4 }}>❌ Download failed</div>
+              <div style={{ fontSize: 10, color: "#aa4444", wordBreak: "break-word" }}>{errMsg}</div>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={onClose} style={{ flex: 1, background: "none", border: `1px solid ${C.faint}`, color: C.muted, padding: "11px 0", fontFamily: "Bangers, cursive", fontSize: 12, borderRadius: 8, cursor: "pointer" }}>CANCEL</button>
+              <button onClick={startDownload} style={{ flex: 2, background: C.gold, color: "#000", border: "none", padding: "11px 0", fontFamily: "Bangers, cursive", fontSize: 12, letterSpacing: 2, cursor: "pointer", borderRadius: 8 }}>RETRY →</button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SettingsDrawer({ activeApi, setActiveApi, keys, setKeys, targetLang, setTargetLang, fontStyle, setFontStyle, memoryTier, setMemoryTierVal, downloadFolder, setDownloadFolder, modelsReady, onDownloadAI, onClose }) {
   const [editApi, setEditApi] = useState(activeApi);
   const [keyInput, setKeyInput] = useState(keys[activeApi] ? "••••" + keys[activeApi].slice(-4) : "");
   const [show, setShow] = useState(false);
@@ -596,6 +832,57 @@ function SettingsDrawer({ activeApi, setActiveApi, keys, setKeys, targetLang, se
           </div>
         )}
 
+        {/* Download folder */}
+        <div style={{ marginBottom: 18 }}>
+          <span style={S.label}>SAVE FOLDER</span>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <input
+              value={downloadFolder}
+              onChange={e => { setDownloadFolder(e.target.value); localStorage.setItem("mt_folder", e.target.value); }}
+              placeholder="Downloads/MangaTranslator"
+              style={{ flex: 1, background: C.bg, border: `1px solid ${C.faint}`, borderRadius: 7, padding: "9px 12px", color: C.text, fontSize: 11, fontFamily: "'Courier New', monospace", outline: "none" }}
+            />
+            <button onClick={() => { setDownloadFolder("Downloads/MangaTranslator"); localStorage.setItem("mt_folder", "Downloads/MangaTranslator"); }}
+              style={{ background: "none", border: `1px solid ${C.faint}`, color: C.muted, padding: "9px 10px", fontSize: 10, borderRadius: 7, cursor: "pointer" }}>↺</button>
+          </div>
+          <div style={{ fontSize: 9, color: C.muted, marginTop: 5, lineHeight: 1.6 }}>
+            Path inside internal storage. CBZ and JPG files will be saved here.<br/>
+            On Android the app needs <em>storage permission</em> to write outside Downloads.
+          </div>
+        </div>
+
+        {/* Pre-download AI model */}
+        <div style={{ marginBottom: 18 }}>
+          <span style={S.label}>ON-DEVICE AI MODEL</span>
+          <div style={{ background: C.bg, border: `1px solid ${modelsReady ? C.green + "55" : C.gold + "44"}`, borderRadius: 10, padding: "12px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+            <div>
+              <div style={{ fontSize: 12, color: modelsReady ? C.green : C.gold }}>
+                {modelsReady ? "✅ NLLB-200 Ready" : "⬇ NLLB-200 Not Downloaded"}
+              </div>
+              <div style={{ fontSize: 9, color: C.muted, marginTop: 3 }}>
+                Meta's multilingual model · ~650MB · 200 languages
+              </div>
+              {modelsReady && (
+                <div style={{ fontSize: 9, color: "#555", marginTop: 2 }}>
+                  Translates offline without any API key
+                </div>
+              )}
+            </div>
+            {!modelsReady && (
+              <button onClick={onDownloadAI}
+                style={{ background: C.gold, color: "#000", border: "none", padding: "8px 14px", fontFamily: "Bangers, cursive", fontSize: 12, letterSpacing: 1, cursor: "pointer", borderRadius: 7, whiteSpace: "nowrap" }}>
+                DOWNLOAD →
+              </button>
+            )}
+            {modelsReady && (
+              <button onClick={onDownloadAI}
+                style={{ background: "none", border: `1px solid ${C.faint}`, color: C.muted, padding: "6px 10px", fontFamily: "Bangers, cursive", fontSize: 10, letterSpacing: 1, cursor: "pointer", borderRadius: 7, whiteSpace: "nowrap" }}>
+                RE-DL
+              </button>
+            )}
+          </div>
+        </div>
+
         {/* AI engine switcher */}
         <div style={{ marginBottom: 14 }}>
           <span style={S.label}>AI ENGINE</span>
@@ -644,14 +931,101 @@ function SettingsDrawer({ activeApi, setActiveApi, keys, setKeys, targetLang, se
 }
 
 // ─── URL Scraper Tab ──────────────────────────────────────────────────────────
+// ─── Cloudflare bypass iframe modal ──────────────────────────────────────────
+// Shows an iframe to happymh.com so the user can solve the CF challenge once.
+// After CF is solved the iframe's src becomes the real manga page (no CF wall).
+// We then retry the API — the cf_clearance cookie is now in the WebView cookie jar.
+function CFBypassModal({ url, onSuccess, onClose, addLog }) {
+  const [status, setStatus] = useState("loading"); // loading | ready | retrying
+  const iframeRef = useRef(null);
+  const timerRef = useRef(null);
+
+  // Detect when CF challenge is resolved by polling iframe title
+  // CF challenge pages have title "Just a moment..." — real pages don't
+  const checkResolved = useCallback(() => {
+    try {
+      const title = iframeRef.current?.contentDocument?.title || "";
+      if (title && !title.includes("Just a moment") && title !== "") {
+        setStatus("ready");
+        clearInterval(timerRef.current);
+      }
+    } catch {
+      // cross-origin access blocked (expected while CF challenge is active)
+    }
+  }, []);
+
+  useEffect(() => {
+    // Poll every 500ms for CF resolution
+    timerRef.current = setInterval(checkResolved, 500);
+    // Also try after 8 seconds regardless (CF JS challenge usually auto-resolves)
+    const fallback = setTimeout(() => setStatus("ready"), 8000);
+    return () => { clearInterval(timerRef.current); clearTimeout(fallback); };
+  }, [checkResolved]);
+
+  const handleRetry = async () => {
+    setStatus("retrying");
+    addLog("🍪 CF challenge passed — retrying HappyMH API…");
+    try {
+      const dataUrls = await retryHappyMHAfterCF(url, addLog);
+      if (!dataUrls.length) throw new Error("No pages found after CF bypass.");
+      addLog(`✅ Downloaded ${dataUrls.length} pages — starting translation…`);
+      onSuccess(dataUrls);
+    } catch (e) {
+      addLog(`❌ ${e.message}`);
+      onClose(e.message);
+    }
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "#000d", zIndex: 9999, display: "flex", flexDirection: "column" }}>
+      {/* Header */}
+      <div style={{ background: "#111", padding: "10px 14px", display: "flex", alignItems: "center", justifyContent: "space-between", borderBottom: `1px solid ${C.faint}` }}>
+        <div>
+          <div style={{ color: C.gold, fontFamily: "Bangers, cursive", fontSize: 14, letterSpacing: 2 }}>🔒 CLOUDFLARE CHECK</div>
+          <div style={{ color: C.muted, fontSize: 10, marginTop: 2 }}>HappyMH requires a quick browser check. It usually passes automatically.</div>
+        </div>
+        <button onClick={() => onClose(null)} style={{ background: "none", border: `1px solid ${C.faint}`, color: C.muted, borderRadius: 6, padding: "4px 10px", fontSize: 11, cursor: "pointer" }}>✕ Cancel</button>
+      </div>
+
+      {/* iframe */}
+      <iframe
+        ref={iframeRef}
+        src={url}
+        style={{ flex: 1, border: "none", width: "100%" }}
+        title="Cloudflare bypass"
+        sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+      />
+
+      {/* Footer */}
+      <div style={{ background: "#111", padding: "10px 14px", borderTop: `1px solid ${C.faint}`, display: "flex", alignItems: "center", gap: 10 }}>
+        {status === "loading" && (
+          <div style={{ color: C.muted, fontSize: 11 }}>⏳ Waiting for Cloudflare check to complete…</div>
+        )}
+        {status === "ready" && (
+          <>
+            <div style={{ color: C.green, fontSize: 11, flex: 1 }}>✅ Check passed! Tap Continue to fetch pages.</div>
+            <button onClick={handleRetry} style={{ background: C.gold, color: "#000", border: "none", borderRadius: 7, padding: "8px 18px", fontFamily: "Bangers, cursive", fontSize: 14, letterSpacing: 2, cursor: "pointer" }}>
+              CONTINUE →
+            </button>
+          </>
+        )}
+        {status === "retrying" && (
+          <div style={{ color: C.muted, fontSize: 11 }}>⟳ Fetching manga pages…</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function URLTab({ onImagesReady }) {
   const [url, setUrl] = useState("");
   const [loading, setLoading] = useState(false);
   const [log, setLog] = useState([]);
   const [error, setError] = useState("");
+  const [cfBypassUrl, setCfBypassUrl] = useState(null); // triggers CF modal
   const logRef = useRef(null);
 
-  const addLog = msg => setLog(l => { const n = [...l, msg]; return n; });
+  const addLog = msg => setLog(l => [...l, msg]);
 
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
@@ -661,26 +1035,43 @@ function URLTab({ onImagesReady }) {
     if (!url.trim()) return;
     setLoading(true); setLog([]); setError("");
     try {
-      addLog(`🌐 Connecting to ${new URL(url.trim()).hostname}…`);
       const dataUrls = await scrapeURL(url.trim(), addLog);
       if (!dataUrls.length) throw new Error("No manga pages found on this URL.");
       addLog(`✅ Downloaded ${dataUrls.length} page${dataUrls.length > 1 ? "s" : ""} — starting translation…`);
       onImagesReady(dataUrls, url.trim());
     } catch (e) {
-      setError(e.message);
-      addLog(`❌ ${e.message}`);
-    } finally {
-      setLoading(false);
+      if (e.message.startsWith("NEEDS_CF_BYPASS:")) {
+        // Show iframe modal so user can solve CF, then auto-retry
+        const targetUrl = e.message.replace("NEEDS_CF_BYPASS:", "");
+        addLog("🔒 Cloudflare protection detected — opening bypass screen…");
+        setLoading(false);
+        setCfBypassUrl(targetUrl);
+      } else {
+        setError(e.message);
+        addLog(`❌ ${e.message}`);
+        setLoading(false);
+      }
     }
   };
 
-  const examples = [
-    "https://mangadex.org/chapter/...",
-    "https://any-manga-site.com/chapter-1",
-  ];
-
   return (
     <div style={{ flex: 1, overflowY: "auto", padding: 14 }}>
+      {/* CF bypass modal — shown over entire screen */}
+      {cfBypassUrl && (
+        <CFBypassModal
+          url={cfBypassUrl}
+          addLog={addLog}
+          onSuccess={dataUrls => {
+            setCfBypassUrl(null);
+            onImagesReady(dataUrls, cfBypassUrl);
+          }}
+          onClose={errMsg => {
+            setCfBypassUrl(null);
+            if (errMsg) setError(errMsg);
+          }}
+        />
+      )}
+
       <div style={{ ...S.card, marginBottom: 14 }}>
         <span style={S.label}>MANGA CHAPTER URL</span>
         <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
@@ -699,6 +1090,7 @@ function URLTab({ onImagesReady }) {
 
         <div style={{ fontSize: 10, color: C.muted, lineHeight: 1.8 }}>
           ✅ <span style={{ color: C.green }}>MangaDex</span> — full API support, best quality<br/>
+          🟡 <span style={{ color: C.gold }}>HappyMH</span> — real API + auto Cloudflare bypass<br/>
           🌐 <span style={{ color: "#aaa" }}>Any manga site</span> — auto image extraction
         </div>
       </div>
@@ -715,13 +1107,12 @@ function URLTab({ onImagesReady }) {
         </div>
       )}
 
-      {/* Tips */}
       <div style={{ ...S.card, fontSize: 11, color: C.muted, lineHeight: 1.9 }}>
         <div style={{ color: C.gold, fontFamily: "Bangers, cursive", fontSize: 13, letterSpacing: 2, marginBottom: 8 }}>💡 TIPS</div>
         <div>• Paste a <span style={{ color: C.text }}>chapter page URL</span>, not the manga homepage</div>
         <div>• MangaDex URLs look like: <span style={{ color: "#aaa", fontFamily: "monospace" }}>mangadex.org/chapter/UUID</span></div>
+        <div>• HappyMH URLs look like: <span style={{ color: "#aaa", fontFamily: "monospace" }}>m.happymh.com/mangaread/title/123</span></div>
         <div>• If a site blocks scraping, save the pages as a <span style={{ color: C.text }}>.cbz file</span> and use the File tab instead</div>
-        <div>• Some sites require login — the app can't bypass that</div>
       </div>
     </div>
   );
@@ -740,8 +1131,12 @@ export default function App() {
   const [memoryTier, setMemoryTierVal] = useState(localStorage.getItem("mt_memory") || "medium");
 
   const [tab, setTab]         = useState("file"); // "file" | "url"
+  const [downloadFolder, setDownloadFolder] = useState(localStorage.getItem("mt_folder") || "Downloads/MangaTranslator");
+  const [showDownloadAI, setShowDownloadAI] = useState(false);
+  const [modelsReady, setModelsReady]       = useState(areModelsDownloaded());
   const [view, setView]       = useState("translate"); // "translate" | "reader"
-  const [pages, setPages]     = useState([]);
+  const [pages, setPages]         = useState([]);
+  const [originals, setOriginals]   = useState([]); // raw dataUrls before translation
   const [status, setStatus]   = useState("idle");
   const [progress, setProgress] = useState({ current: 0, total: 0 });
   const [log, setLog]         = useState([]);
@@ -768,7 +1163,10 @@ export default function App() {
   // ── Core translate pipeline ──────────────────────────────────────────────────
   const translateDataUrls = async (dataUrls, sourceLabel) => {
     if (!fontReady) await loadFonts();
-    setStatus("loading"); setLog([]); setPages([]); outputsRef.current = [];
+    setStatus("loading"); setLog([]); setPages([]); setOriginals(dataUrls); outputsRef.current = [];
+    // Request notification permission and show initial notification
+    await requestNotificationPermission();
+    await showProgressNotification("Manga Translator", "Starting translation…", 0, dataUrls.length);
     const apiKey = keys[activeApi];
 
     if (activeApi !== "ondevice" && !apiKey) {
@@ -787,6 +1185,7 @@ export default function App() {
         for (let i = 0; i < totalPages; i++) {
           setProgress({ current: i + 1, total: totalPages });
           addLog(`🔄 [${i+1}/${totalPages}] Page ${i + 1}`);
+          await showProgressNotification("Translating…", `Page ${i+1} of ${totalPages}`, i+1, totalPages);
           let bubbles = [];
           try {
             const r = await translatePageOnDevice(dataUrls[i], "chi_sim", targetLang, addLog, addLog);
@@ -834,6 +1233,7 @@ export default function App() {
             setProgress({ current: idx + 1, total: totalPages });
             outputsRef.current = results.filter(Boolean);
             setPages([...outputsRef.current]);
+            await showProgressNotification("Translating…", `Page ${idx+1} of ${totalPages}`, idx+1, totalPages);
           }
 
           if (bi < numBatches - 1 && activeApi === "gemini") {
@@ -845,8 +1245,11 @@ export default function App() {
 
       setStatus("done");
       addLog(`✅ Done! ${totalPages} pages translated → ${targetLang}`);
+      await showProgressNotification("Manga Translator ✅", `${totalPages} pages translated!`, totalPages, totalPages);
+      setTimeout(cancelProgressNotification, 4000);
     } catch (e) {
       setStatus("error"); addLog(`❌ ${e.message}`);
+      cancelProgressNotification();
     }
   };
 
@@ -910,15 +1313,36 @@ export default function App() {
 
       {/* Action buttons */}
       {status === "done" && (
-        <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+        <div style={{ marginBottom: 12 }}>
+          {/* Primary: Read */}
           <button onClick={() => setView("reader")}
-            style={{ flex: 2, background: C.gold, color: "#000", border: "none", padding: "13px 0", fontFamily: "Bangers, cursive", fontSize: 14, letterSpacing: 2, cursor: "pointer", borderRadius: 8 }}>
-            📖 READ
+            style={{ width: "100%", background: C.gold, color: "#000", border: "none", padding: "13px 0", fontFamily: "Bangers, cursive", fontSize: 15, letterSpacing: 2, cursor: "pointer", borderRadius: 8, marginBottom: 8 }}>
+            📖 READ TRANSLATED
           </button>
-          <button onClick={() => outputsRef.current.forEach(({ name, src }) => { const a = document.createElement("a"); a.href = src; a.download = name; a.click(); })}
-            style={{ flex: 1, background: "transparent", color: "#888", border: `1px solid ${C.border}`, padding: "13px 0", fontFamily: "Bangers, cursive", fontSize: 12, letterSpacing: 2, cursor: "pointer", borderRadius: 8 }}>
-            ↓ SAVE
-          </button>
+          {/* Save row */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
+            <button
+              title="Save translated pages as individual JPG files"
+              onClick={() => saveJPGs(outputsRef.current, downloadFolder)}
+              style={{ background: "#111", color: C.gold, border: `1px solid ${C.gold}44`, padding: "10px 4px", fontFamily: "Bangers, cursive", fontSize: 11, letterSpacing: 1, cursor: "pointer", borderRadius: 7, textAlign: "center", lineHeight: 1.4 }}>
+              ↓ JPGs<br/><span style={{ fontSize: 9, color: C.muted, fontFamily: "monospace" }}>Translated</span>
+            </button>
+            <button
+              title="Save translated pages as a single CBZ archive"
+              onClick={() => saveCBZ(outputsRef.current, "chapter-translated.cbz", downloadFolder)}
+              style={{ background: "#111", color: C.gold, border: `1px solid ${C.gold}44`, padding: "10px 4px", fontFamily: "Bangers, cursive", fontSize: 11, letterSpacing: 1, cursor: "pointer", borderRadius: 7, textAlign: "center", lineHeight: 1.4 }}>
+              📦 CBZ<br/><span style={{ fontSize: 9, color: C.muted, fontFamily: "monospace" }}>Translated</span>
+            </button>
+            <button
+              title="Save original untranslated pages as a CBZ archive"
+              onClick={() => {
+                const origPages = originals.map((src, i) => ({ name: `page-${String(i+1).padStart(3,"0")}.jpg`, src }));
+                saveCBZ(origPages, "chapter-original.cbz", downloadFolder);
+              }}
+              style={{ background: "#111", color: "#888", border: `1px solid ${C.faint}`, padding: "10px 4px", fontFamily: "Bangers, cursive", fontSize: 11, letterSpacing: 1, cursor: "pointer", borderRadius: 7, textAlign: "center", lineHeight: 1.4 }}>
+              📦 CBZ<br/><span style={{ fontSize: 9, color: C.muted, fontFamily: "monospace" }}>Original</span>
+            </button>
+          </div>
         </div>
       )}
 
@@ -942,9 +1366,29 @@ export default function App() {
       )}
 
       {pages.length === 0 && status === "idle" && (
-        <div style={{ textAlign: "center", padding: "32px 0", color: "#1c1c1c" }}>
+        <div style={{ textAlign: "center", padding: "28px 0 0", color: "#1c1c1c" }}>
           <div style={{ fontFamily: "Bangers, cursive", fontSize: 52, letterSpacing: 8 }}>漫画</div>
           <div style={{ fontSize: 10, letterSpacing: 3, marginTop: 6 }}>OPEN A FILE OR FETCH A URL TO BEGIN</div>
+
+          {/* Model download banner — only shown when using on-device and models not cached */}
+          {activeApi === "ondevice" && !modelsReady && (
+            <div style={{ margin: "20px 16px 0", background: "#0e0b00", border: `1px solid ${C.gold}44`, borderRadius: 12, padding: "14px 16px", textAlign: "left" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                <div style={{ fontFamily: "Bangers, cursive", fontSize: 14, letterSpacing: 2, color: C.gold }}>⬇ AI MODEL NOT DOWNLOADED</div>
+              </div>
+              <div style={{ fontSize: 10, color: C.muted, lineHeight: 1.7, marginBottom: 12 }}>
+                On-Device translation uses <strong style={{ color: C.text }}>NLLB-200</strong> (~650MB).<br/>
+                Download it once over Wi-Fi, then translate offline forever — free, no API key needed.
+              </div>
+              <button onClick={() => setShowDownloadAI(true)}
+                style={{ width: "100%", background: C.gold, color: "#000", border: "none", padding: "11px 0", fontFamily: "Bangers, cursive", fontSize: 14, letterSpacing: 2, cursor: "pointer", borderRadius: 8 }}>
+                DOWNLOAD AI MODEL →
+              </button>
+              <div style={{ fontSize: 9, color: "#444", marginTop: 8, textAlign: "center" }}>
+                Or switch to Gemini / Claude / OpenAI in ⚙️ Settings — they work without downloading anything.
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -1033,7 +1477,17 @@ export default function App() {
           targetLang={targetLang} setTargetLang={setTargetLang}
           fontStyle={fontStyle} setFontStyle={setFontStyle}
           memoryTier={memoryTier} setMemoryTierVal={setMemoryTierVal}
+          downloadFolder={downloadFolder} setDownloadFolder={setDownloadFolder}
+          modelsReady={modelsReady}
+          onDownloadAI={() => { setShowSettings(false); setShowDownloadAI(true); }}
           onClose={() => setShowSettings(false)}
+        />
+      )}
+
+      {showDownloadAI && (
+        <DownloadAIModal
+          onDone={() => { setModelsReady(true); setShowDownloadAI(false); }}
+          onClose={() => setShowDownloadAI(false)}
         />
       )}
     </div>

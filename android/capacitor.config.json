@@ -9,5 +9,15 @@
   "android": {
     "allowMixedContent": true,
     "backgroundColor": "#0e0e0e"
+  },
+  "plugins": {
+    "LocalNotifications": {
+      "smallIcon": "ic_stat_icon_config_sample",
+      "iconColor": "#d4a017",
+      "sound": "beep.wav"
+    },
+    "Filesystem": {
+      "iosScheme": "capacitor"
+    }
   }
 }
