@@ -109,17 +109,24 @@ jobs:
         shell: pwsh
         run: |
           $tag = "${{ needs.setup.outputs.tag }}"
-          # electron-builder names files like "Manga Translator 2.0.0.exe" (installer)
-          # and "Manga Translator 2.0.0 Portable.exe" — neither contains "Setup"
-          # Rule: if filename contains Portable → Portable, otherwise → Setup
-          Get-ChildItem "windows/release/*.exe" | ForEach-Object {
-            if ($_.Name -match "Portable") {
-              $newName = "MangaTranslator-${tag}-Windows-Portable.exe"
-            } else {
-              $newName = "MangaTranslator-${tag}-Windows-Setup.exe"
-            }
-            Rename-Item $_.FullName $newName
-            Write-Host "Renamed: $($_.Name) -> $newName"
+          $dir = Resolve-Path "windows/release"
+          Write-Host "Files in release dir:"
+          Get-ChildItem $dir | ForEach-Object { Write-Host "  $($_.Name)" }
+
+          # electron-builder actual output:
+          #   "Manga Translator Setup X.X.X.exe"  → NSIS installer (has "Setup")
+          #   "Manga Translator X.X.X.exe"        → portable (no "Setup")
+          # Rename-Item dst must be bare filename only, not a path
+          $installer = Get-ChildItem "$dir/*.exe" | Where-Object { $_.Name -match "Setup" } | Select-Object -First 1
+          $portable  = Get-ChildItem "$dir/*.exe" | Where-Object { $_.Name -notmatch "Setup" } | Select-Object -First 1
+
+          if ($installer) {
+            Rename-Item $installer.FullName "MangaTranslator-${tag}-Windows-Setup.exe"
+            Write-Host "Installer renamed OK"
+          }
+          if ($portable) {
+            Rename-Item $portable.FullName "MangaTranslator-${tag}-Windows-Portable.exe"
+            Write-Host "Portable renamed OK"
           }
 
       - name: Upload EXE artifacts
