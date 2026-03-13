@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+android/node_modules/
+windows/node_modules/
+
+# Build outputs
+dist/
+android/dist/
+windows/dist/
+windows/release/
+
+# Capacitor native Android project (auto-generated, not source)
+android/android/
+
+# Electron build cache
+windows/.electron-builder-cache/
+
+# Environment
+.env
+.env.local
+*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*

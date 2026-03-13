@@ -1,0 +1,207 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag (e.g. v2.1.0)"
+        required: true
+        default: "v2.1.0"
+
+jobs:
+  # ─── Resolve tag (works for both push-tag and manual dispatch) ───────────────
+  setup:
+    name: 🏷️ Resolve Tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.get_tag.outputs.tag }}
+    steps:
+      - name: Get tag
+        id: get_tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+  # ─── Android APK ─────────────────────────────────────────────────────────────
+  build-android:
+    name: 🤖 Android APK
+    runs-on: ubuntu-latest
+    needs: setup
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install dependencies
+        working-directory: android
+        run: npm install
+
+      - name: Build web assets
+        working-directory: android
+        run: npm run build
+
+      - name: Add Capacitor Android platform
+        working-directory: android
+        run: npx cap add android
+
+      - name: Sync Capacitor
+        working-directory: android
+        run: npx cap sync android
+
+      - name: Make Gradle executable
+        working-directory: android
+        run: chmod +x android/gradlew
+
+      - name: Build APK
+        working-directory: android
+        run: cd android && ./gradlew assembleDebug --no-daemon
+
+      - name: Rename APK
+        run: |
+          mv android/android/app/build/outputs/apk/debug/app-debug.apk \
+             "MangaTranslator-${{ needs.setup.outputs.tag }}-Android.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk-${{ needs.setup.outputs.tag }}
+          path: "MangaTranslator-*-Android.apk"
+          retention-days: 3
+
+  # ─── Windows EXE ─────────────────────────────────────────────────────────────
+  build-windows:
+    name: 🪟 Windows EXE
+    runs-on: windows-latest
+    needs: setup
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        working-directory: windows
+        run: npm install
+
+      - name: Build and package
+        working-directory: windows
+        run: npm run dist
+
+      - name: List release files
+        working-directory: windows/release
+        run: dir
+
+      - name: Rename EXE files
+        shell: pwsh
+        run: |
+          $tag = "${{ needs.setup.outputs.tag }}"
+          # electron-builder names files like "Manga Translator 2.0.0.exe" (installer)
+          # and "Manga Translator 2.0.0 Portable.exe" — neither contains "Setup"
+          # Rule: if filename contains Portable → Portable, otherwise → Setup
+          Get-ChildItem "windows/release/*.exe" | ForEach-Object {
+            if ($_.Name -match "Portable") {
+              $newName = "MangaTranslator-${tag}-Windows-Portable.exe"
+            } else {
+              $newName = "MangaTranslator-${tag}-Windows-Setup.exe"
+            }
+            Rename-Item $_.FullName $newName
+            Write-Host "Renamed: $($_.Name) -> $newName"
+          }
+
+      - name: Upload EXE artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe-${{ needs.setup.outputs.tag }}
+          path: windows/release/MangaTranslator-*.exe
+          retention-days: 3
+
+  # ─── Create GitHub Release ────────────────────────────────────────────────────
+  release:
+    name: 🚀 Publish Release
+    needs: [setup, build-android, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Android APK
+        uses: actions/download-artifact@v4
+        with:
+          name: android-apk-${{ needs.setup.outputs.tag }}
+          path: artifacts/
+
+      - name: Download Windows EXE
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-exe-${{ needs.setup.outputs.tag }}
+          path: artifacts/
+
+      - name: List artifacts
+        run: ls -lh artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.setup.outputs.tag }}
+          name: "Manga Translator ${{ needs.setup.outputs.tag }}"
+          create_tag: true
+          body: |
+            ## Manga Translator ${{ needs.setup.outputs.tag }}
+
+            Translate Chinese, Japanese and Korean manga from `.cbz` files or directly from any manga website URL — using Claude AI, Google Gemini, or fully offline on-device AI.
+
+            ---
+
+            ### ⬇️ Downloads
+
+            | Platform | File | Requirements |
+            |----------|------|--------------|
+            | 🤖 Android | `MangaTranslator-${{ needs.setup.outputs.tag }}-Android.apk` | Android 7.0+ |
+            | 🪟 Windows Installer | `MangaTranslator-${{ needs.setup.outputs.tag }}-Windows-Setup.exe` | Windows 10/11 x64 |
+            | 🪟 Windows Portable | `MangaTranslator-${{ needs.setup.outputs.tag }}-Windows-Portable.exe` | Windows 10/11 x64, no install |
+
+            ---
+
+            ### 🤖 AI Engines
+            | Engine | Cost | Notes |
+            |--------|------|-------|
+            | 📱 On-Device | Free forever | ~150MB download once, then fully offline |
+            | ✨ Google Gemini | Free (1,500/day) | [Get key](https://aistudio.google.com/app/apikey) |
+            | 🧠 Anthropic Claude | Paid | [Get key](https://console.anthropic.com/settings/keys) |
+            | 💬 OpenAI GPT-4o | Paid | [Get key](https://platform.openai.com/api-keys) |
+            | ⚡ Mistral Pixtral | Free tier | [Get key](https://console.mistral.ai/api-keys) |
+
+            ---
+
+            ### 📱 Android Install
+            1. Download the `.apk` to your phone
+            2. Files app → tap APK → allow unknown sources → Install
+
+            ### 🪟 Windows Install
+            - **Installer**: Run Setup.exe and follow the prompts
+            - **Portable**: Just double-click — no installation needed
+
+            ---
+
+            Full source & build docs: [README](https://github.com/${{ github.repository }}#readme)
+          files: artifacts/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          fail_on_unmatched_files: false

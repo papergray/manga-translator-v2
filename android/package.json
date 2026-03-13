@@ -1,0 +1,24 @@
+{
+  "name": "manga-translator-android",
+  "version": "2.0.0",
+  "description": "Manga Translator — AI-powered CBZ and web manga translation for Android",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@capacitor/android": "5.7.4",
+    "@capacitor/core": "5.7.4",
+    "@xenova/transformers": "^2.17.2",
+    "tesseract.js": "^5.1.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "5.7.4",
+    "@vitejs/plugin-react": "^4.3.1",
+    "vite": "^5.4.1"
+  }
+}
