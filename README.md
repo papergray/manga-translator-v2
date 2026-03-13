@@ -10,7 +10,7 @@
 ![Open Source](https://img.shields.io/badge/open%20source-yes-brightgreen?style=flat-square)
 ![Release](https://img.shields.io/github/v/release/papergray/manga-translator?style=flat-square&color=d4a017)
 
-**[⬇ Download Latest Release](../../releases/latest)**
+**[Download Latest Release](../../releases/latest)**
 
 </div>
 
