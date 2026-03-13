@@ -8,15 +8,8 @@
 ![Windows](https://img.shields.io/badge/Windows-10%2F11-blue?style=flat-square&logo=windows)
 ![License](https://img.shields.io/badge/license-MIT-gray?style=flat-square)
 ![Open Source](https://img.shields.io/badge/open%20source-yes-brightgreen?style=flat-square)
+![Release](https://img.shields.io/github/v/release/YOUR_USERNAME/manga-translator?style=flat-square&color=d4a017)
 
-**[⬇ Download Latest Release](../../releases/latest)**
-
-</div>
-
-> 💡 **After pushing your first release**, add this badge by replacing `YOUR_USERNAME` with your GitHub username:
-> ```
-> ![Release](https://img.shields.io/github/v/release/YOUR_USERNAME/manga-translator?style=flat-square&color=d4a017)
-> ```
 
 ---
 
@@ -94,30 +87,6 @@ manga-translator/
 │       └── App.jsx       ← same UI, desktop tweaks
 └── .github/workflows/
     └── release.yml       ← builds both + publishes release
-```
-
-### Android
-```bash
-cd android
-npm install
-npm run build
-npx cap add android
-npx cap sync android
-cd android && ./gradlew assembleDebug
-```
-
-### Windows
-```bash
-cd windows
-npm install
-npm run dist    # → windows/release/*.exe
-```
-
-### Release (automated)
-Push a version tag — both apps build automatically and attach to a GitHub Release:
-```bash
-git tag v2.0.0
-git push origin v2.0.0
 ```
 
 ---
