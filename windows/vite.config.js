@@ -8,7 +8,13 @@ export default defineConfig({
     outDir: "dist",
     assetsDir: "assets",
     rollupOptions: {
-      external: ["electron"],
+      external: [
+        "electron",
+        "@capacitor/core",
+        "@capacitor/filesystem",
+        "@capacitor/local-notifications",
+        "@capacitor/android",
+      ],
     },
   },
   optimizeDeps: {

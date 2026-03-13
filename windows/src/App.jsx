@@ -39,14 +39,20 @@ async function loadJSZip() {
 
 // ─── Capacitor Filesystem + Notifications (Android) ─────────────────────────
 async function getCapacitorFilesystem() {
+  // Capacitor only available on Android — gracefully return null on Windows/web
+  if (typeof window === "undefined" || !window.Capacitor) return null;
   try {
-    const mod = await import("@capacitor/filesystem");
+    // Use Function constructor so Rollup won't try to bundle this path
+    const imp = new Function("m", "return import(m)");
+    const mod = await imp("@capacitor/filesystem");
     return mod.Filesystem;
   } catch { return null; }
 }
 async function getCapacitorNotifications() {
+  if (typeof window === "undefined" || !window.Capacitor) return null;
   try {
-    const mod = await import("@capacitor/local-notifications");
+    const imp = new Function("m", "return import(m)");
+    const mod = await imp("@capacitor/local-notifications");
     return mod.LocalNotifications;
   } catch { return null; }
 }
