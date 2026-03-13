@@ -8,7 +8,7 @@
 ![Windows](https://img.shields.io/badge/Windows-10%2F11-blue?style=flat-square&logo=windows)
 ![License](https://img.shields.io/badge/license-MIT-gray?style=flat-square)
 ![Open Source](https://img.shields.io/badge/open%20source-yes-brightgreen?style=flat-square)
-![Release](https://img.shields.io/github/v/release/YOUR_USERNAME/manga-translator?style=flat-square&color=d4a017)
+![Release](https://img.shields.io/github/v/release/papergray/manga-translator?style=flat-square&color=d4a017)
 
 
 ---
